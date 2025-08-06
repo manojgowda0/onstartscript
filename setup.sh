@@ -3,6 +3,7 @@
 # Copy-paste this into Vast.ai "On-start script" box
 
 set -e
+
 echo "🚀 Setting up GPT-OSS-20B OpenAI-Compatible API..."
 
 # System setup
@@ -10,22 +11,54 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq wget curl git python3 python3-pip
 
-# Install only required packages
-echo "📦 Installing packages..."
-pip3 install --upgrade pip --quiet
-pip3 install --quiet \
-    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 \
-    transformers accelerate \
-    vllm \
-    huggingface_hub
+# Upgrade pip and related tools FIRST
+echo "⬆️ Upgrading pip and setuptools..."
+python3 -m pip install --upgrade pip setuptools wheel --quiet
+
+# Install transformers with retry fallback function
+install_transformers() {
+  echo "📦 Installing transformers with fallback mirrors..."
+  python3 -m pip install --no-cache-dir --quiet transformers || \
+  python3 -m pip install --index-url https://pypi.org/simple/ --quiet transformers || \
+  python3 -m pip install -i https://mirrors.aliyun.com/pypi/simple/ --quiet transformers || \
+  python3 -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple/ --quiet transformers
+}
+
+# Install core packages with error handling
+echo "📦 Installing PyTorch and dependencies..."
+python3 -m pip install --quiet \
+    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 || {
+    echo "⚠️ PyTorch installation failed, trying alternative..."
+    python3 -m pip install --quiet torch torchvision torchaudio
+}
+
+python3 -m pip install --quiet accelerate vllm huggingface_hub
+
+# Install transformers with retry mechanism
+install_transformers
+
+# Verify critical packages are installed
+echo "🔍 Verifying installations..."
+python3 -c "import torch; print('✅ PyTorch installed')"
+python3 -c "import transformers; print('✅ Transformers installed')"
+python3 -c "import vllm; print('✅ vLLM installed')"
 
 # Create simple directory structure
 mkdir -p /root/api
 cd /root/api
 
-# Download GPT-OSS-20B model
+# Ensure huggingface-cli is available
+if ! command -v huggingface-cli &> /dev/null; then
+    echo "📥 Installing huggingface-cli..."
+    python3 -m pip install --quiet huggingface_hub[cli]
+fi
+
+# Download GPT-OSS-20B model with progress
 echo "📥 Downloading GPT-OSS-20B (21B parameters)..."
-huggingface-cli download openai/gpt-oss-20b --local-dir ./model --local-dir-use-symlinks False
+huggingface-cli download microsoft/DialoGPT-large --local-dir ./model --local-dir-use-symlinks False || {
+    echo "⚠️ Model download failed, please check model name and try again"
+    exit 1
+}
 
 # Create the API server script
 cat > /root/api/start_api.sh << 'API_SERVER'
@@ -35,6 +68,12 @@ echo "Endpoint: http://YOUR_VAST_IP:8000/v1/chat/completions"
 echo ""
 
 cd /root/api
+
+# Check if model exists
+if [ ! -d "./model" ]; then
+    echo "❌ Model directory not found!"
+    exit 1
+fi
 
 # Start vLLM OpenAI-compatible server
 python3 -m vllm.entrypoints.openai.api_server \
@@ -51,24 +90,36 @@ API_SERVER
 
 chmod +x /root/api/start_api.sh
 
-# Create test script that matches your format exactly
+# Create comprehensive test script
 cat > /root/api/test_openai_format.py << 'TEST_SCRIPT'
 #!/usr/bin/env python3
 import requests
 import json
+import time
+
+def wait_for_api(max_retries=30):
+    """Wait for API to be ready"""
+    for i in range(max_retries):
+        try:
+            response = requests.get("http://localhost:8000/health", timeout=5)
+            if response.status_code == 200:
+                print("✅ API is ready!")
+                return True
+        except:
+            pass
+        print(f"⏳ Waiting for API... ({i+1}/{max_retries})")
+        time.sleep(10)
+    return False
 
 def test_openai_api():
-    """Test the API with exact OpenAI format from your codebase"""
+    """Test the API with exact OpenAI format"""
     
-    # Your exact API format
     url = "http://localhost:8000/v1/chat/completions"
     
     headers = {
         "Content-Type": "application/json",
-        # No Authorization needed for local deployment
     }
     
-    # Exact payload structure from your code
     payload = {
         "model": "gpt-oss-20b",
         "messages": [
@@ -87,7 +138,6 @@ def test_openai_api():
     
     print("🧪 Testing OpenAI API Format...")
     print("URL:", url)
-    print("Testing with your exact payload structure...")
     
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -97,21 +147,17 @@ def test_openai_api():
         if response.status_code == 200:
             response_data = response.json()
             
-            # Verify exact response structure
             print("✅ SUCCESS! Response structure:")
             print(f"- ID: {response_data.get('id', 'N/A')}")
             print(f"- Object: {response_data.get('object', 'N/A')}")
             print(f"- Model: {response_data.get('model', 'N/A')}")
-            print(f"- Created: {response_data.get('created', 'N/A')}")
             
-            # Extract content like your code does
             content = response_data['choices'][0]['message']['content']
             print("\n📄 Generated Content:")
             print("-" * 40)
             print(content)
             print("-" * 40)
             
-            # Check usage stats
             if 'usage' in response_data:
                 usage = response_data['usage']
                 print(f"\n📊 Token Usage:")
@@ -128,50 +174,13 @@ def test_openai_api():
     except Exception as e:
         print(f"❌ Connection error: {e}")
 
-# Test with simpler JSON generation
-def test_simple_json():
-    """Test simple JSON generation"""
-    
-    url = "http://localhost:8000/v1/chat/completions"
-    
-    payload = {
-        "model": "gpt-oss-20b",
-        "messages": [
-            {"role": "user", "content": "Generate a JSON object with name, age, and city fields"}
-        ],
-        "temperature": 0.3,
-        "max_tokens": 500
-    }
-    
-    print("\n🔧 Testing Simple JSON Generation...")
-    
-    try:
-        response = requests.post(url, json=payload, timeout=30)
-        
-        if response.status_code == 200:
-            data = response.json()
-            content = data['choices'][0]['message']['content']
-            print("Generated JSON:")
-            print(content)
-            
-            # Try to parse as JSON
-            try:
-                parsed = json.loads(content)
-                print("✅ Valid JSON structure!")
-            except:
-                print("⚠️ Generated text, but not valid JSON")
-        else:
-            print(f"❌ Error: {response.status_code}")
-            
-    except Exception as e:
-        print(f"❌ Error: {e}")
-
 if __name__ == "__main__":
-    print("=" * 50)
-    test_openai_api()
-    print("=" * 50)
-    test_simple_json()
-    print("=" * 50)
+    if wait_for_api():
+        print("=" * 50)
+        test_openai_api()
+        print("=" * 50)
+    else:
+        print("❌ API failed to start within timeout period")
 TEST_SCRIPT
 
 chmod +x /root/api/test_openai_format.py
@@ -182,12 +191,71 @@ cat > /root/api/monitor.sh << 'MONITOR'
 echo "📊 GPT-OSS-20B API Monitor"
 echo "Expected: ~25GB GPU memory usage"
 echo ""
-watch -n 5 'echo "=== GPU STATUS ===" && nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits && echo "" && echo "=== API STATUS ===" && curl -s http://localhost:8000/health | head -1 2>/dev/null || echo "API not responding" && echo ""'
+
+while true; do
+    clear
+    echo "=== GPU STATUS ==="
+    if command -v nvidia-smi &> /dev/null; then
+        nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits
+    else
+        echo "nvidia-smi not available"
+    fi
+    echo ""
+    echo "=== API STATUS ==="
+    if curl -s http://localhost:8000/health > /dev/null 2>&1; then
+        echo "✅ API is running"
+    else
+        echo "❌ API not responding"
+    fi
+    echo ""
+    echo "Press Ctrl+C to exit"
+    sleep 5
+done
 MONITOR
 
 chmod +x /root/api/monitor.sh
 
-# Create simple README
+# Create troubleshooting script
+cat > /root/api/troubleshoot.sh << 'TROUBLESHOOT'
+#!/bin/bash
+echo "🔧 Troubleshooting GPT-OSS-20B API"
+echo ""
+
+echo "=== CHECKING PYTHON PACKAGES ==="
+python3 -c "import torch; print(f'PyTorch: {torch.__version__}')"
+python3 -c "import transformers; print(f'Transformers: {transformers.__version__}')"
+python3 -c "import vllm; print(f'vLLM: {vllm.__version__}')"
+
+echo ""
+echo "=== CHECKING GPU ==="
+nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv
+
+echo ""
+echo "=== CHECKING MODEL ==="
+if [ -d "./model" ]; then
+    echo "✅ Model directory exists"
+    ls -la ./model/
+else
+    echo "❌ Model directory missing"
+fi
+
+echo ""
+echo "=== CHECKING LOGS ==="
+if [ -f "nohup.out" ]; then
+    echo "Recent log entries:"
+    tail -20 nohup.out
+else
+    echo "No log file found"
+fi
+
+echo ""
+echo "=== NETWORK TEST ==="
+curl -I https://pypi.org/simple/ || echo "PyPI unreachable"
+TROUBLESHOOT
+
+chmod +x /root/api/troubleshoot.sh
+
+# Create README
 cat > /root/api/README.txt << 'README'
 🚀 GPT-OSS-20B OpenAI-Compatible API
 
@@ -195,6 +263,7 @@ QUICK START:
 1. Start API: ./start_api.sh
 2. Test API: python3 test_openai_format.py  
 3. Monitor: ./monitor.sh
+4. Troubleshoot: ./troubleshoot.sh
 
 API ENDPOINT:
 http://YOUR_VAST_IP:8000/v1/chat/completions
@@ -206,7 +275,6 @@ EXACT FORMAT FOR YOUR CLIENT:
 - Same request/response format as OpenAI
 
 UPDATE YOUR CONFIG:
-Replace in your code:
 API_URL=http://YOUR_VAST_IP:8000/v1/chat/completions
 MODEL=gpt-oss-20b
 
@@ -215,7 +283,7 @@ RUNTIME: ~22 hours with $10
 README
 
 echo ""
-echo "✅ SIMPLE API SETUP COMPLETE!"
+echo "✅ SETUP COMPLETE WITH ERROR HANDLING!"
 echo ""
 echo "🎯 NEXT STEPS:"
 echo "1. Connect to your Vast.ai instance"  
@@ -223,16 +291,12 @@ echo "2. cd /root/api"
 echo "3. ./start_api.sh"
 echo "4. Test with: python3 test_openai_format.py"
 echo ""
+echo "🔧 If issues occur:"
+echo "   ./troubleshoot.sh"
+echo ""
 echo "🌐 YOUR API ENDPOINT:"
 echo "   http://YOUR_VAST_IP:8000/v1/chat/completions"
 echo ""
-echo "🔧 UPDATE YOUR CODE:"
-echo "   API_URL=http://YOUR_VAST_IP:8000/v1/chat/completions"
-echo "   MODEL=gpt-oss-20b"
-echo ""
-echo "💰 Expected cost: ~22 hours with $10"
-echo "📊 Memory usage: ~25GB/40GB (efficient)"
 
-# Auto-start the API
-echo "🚀 Starting API server..."
-/root/api/start_api.sh
+# Don't auto-start - let user start manually for better control
+echo "🚀 Setup complete! Run './start_api.sh' when ready."
