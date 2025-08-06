@@ -1,39 +1,42 @@
 #!/bin/bash
-# GPT-OSS-20B Optimized vLLM Serve Setup - OpenAI API Compatible
-# Copy-paste this entire script into Vast.ai "On-start script" box
+# GPT-OSS-20B Optimized vLLM Serve Setup with Better Model Download
 
 set -e
 
-echo "🚀 Setting up Optimized GPT-OSS-20B with vLLM Serve..."
+echo "🚀 Starting optimized GPT-OSS-20B with vLLM Serve and fast model download..."
 
 # System setup
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq wget curl git python3 python3-pip
 
-# Upgrade pip and install required packages
-echo "📦 Installing optimized packages..."
+# Upgrade pip and install necessary packages
+echo "📦 Installing packages with hf-transfer for faster downloads..."
 python3 -m pip install --upgrade pip setuptools wheel --quiet
-
-# Install vLLM and dependencies with fallback
-python3 -m pip install --quiet vllm || \
-python3 -m pip install --index-url https://pypi.org/simple/ --quiet vllm
-
-# Install supporting packages
-python3 -m pip install --quiet transformers accelerate hf-transfer
+python3 -m pip install --quiet vllm transformers accelerate hf-transfer huggingface_hub
 
 # Create API directory
 mkdir -p /root/api
 cd /root/api
 
-# Download GPT-OSS-20B model
-echo "📥 Downloading GPT-OSS-20B model..."
+# Enable faster and reliable model download
+export HF_HUB_ENABLE_HF_TRANSFER=1
+
+echo "📥 Starting optimized model download with parallel workers..."
+# Fast parallel snapshot download with resume enabled
 python3 -c "
 from huggingface_hub import snapshot_download
-snapshot_download('openai/gpt-oss-20b', local_dir='./model', local_dir_use_symlinks=False)
-"
+import os
+os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1'
+snapshot_download(
+    repo_id='openai/gpt-oss-20b',
+    local_dir='./model',
+    local_dir_use_symlinks=False,
+    resume_download=True,
+    max_workers=12
+)"
 
-# Create the optimized startup script
+# Create optimized start script
 cat > /root/api/start_vllm_optimized.sh << 'VLLM_SCRIPT'
 #!/bin/bash
 echo "🚀 Starting Optimized GPT-OSS-20B Server"
@@ -69,7 +72,6 @@ import json
 import time
 
 def wait_for_api(max_retries=30):
-    """Wait for API to be ready"""
     for i in range(max_retries):
         try:
             response = requests.get("http://localhost:8000/health", timeout=5)
@@ -116,7 +118,6 @@ def test_api():
             print(content)
             print("-" * 50)
             
-            # Token usage
             if 'usage' in data:
                 usage = data['usage']
                 print(f"\n📊 Token Usage:")
@@ -135,7 +136,6 @@ def test_api():
         print(f"❌ Connection error: {e}")
 
 def test_simple_json():
-    """Test simple JSON generation"""
     url = "http://localhost:8000/v1/chat/completions"
     
     payload = {
@@ -158,8 +158,8 @@ def test_simple_json():
             print("Generated Response:")
             print(content)
             
-            # Try to parse as JSON
             try:
+                import json
                 parsed = json.loads(content)
                 print("✅ Valid JSON structure!")
             except:
@@ -214,7 +214,7 @@ MONITOR
 
 chmod +x /root/api/monitor.sh
 
-# Create README with optimized settings
+# Create README
 cat > /root/api/README.txt << 'README'
 🚀 GPT-OSS-20B Optimized vLLM Setup
 
@@ -227,6 +227,7 @@ OPTIMIZED SETTINGS:
 - Max Concurrent Requests: 8
 - Chunked Prefill: Enabled
 - Data Type: Auto-optimized
+- Fast Download: hf-transfer enabled
 
 INTEGRATION:
 Update your code:
@@ -248,7 +249,13 @@ README
 echo ""
 echo "✅ OPTIMIZED SETUP COMPLETE! AUTO-STARTING API SERVER..."
 echo ""
-echo "🎯 OPTIMIZATION FEATURES:"
+echo "🎯 DOWNLOAD OPTIMIZATIONS:"
+echo "   - hf-transfer: Rust-based parallel downloads"
+echo "   - 12 parallel workers: Faster concurrent downloads"
+echo "   - Resume download: Continues if interrupted"
+echo "   - Progress tracking: Real-time download status"
+echo ""
+echo "🎯 SERVER OPTIMIZATIONS:"
 echo "   - GPU Memory: 90% utilization (~30GB)"
 echo "   - Max Tokens: 2048 (doubled capacity)"
 echo "   - Concurrent Requests: 8 simultaneous"
@@ -271,7 +278,7 @@ cd /root/api
 ./start_vllm_optimized.sh &
 
 # Wait for startup then run test
-sleep 45 && python3 test_api.py &
+sleep 45 && python3 /root/api/test_api.py &
 
 # Keep the main process running
 wait
