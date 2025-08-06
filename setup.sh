@@ -1,284 +1,227 @@
 #!/bin/bash
-# GPT-OSS-20B Optimized vLLM Serve Setup with Better Model Download
+echo "🚀 Setting up GPT-OSS-20B OpenAI API Server..."
+echo "$(date): Starting setup" >> /root/setup.log
 
-set -e
-
-echo "🚀 Starting optimized GPT-OSS-20B with vLLM Serve and fast model download..."
-
-# System setup
+# Set environment variables
 export DEBIAN_FRONTEND=noninteractive
+export HF_HOME=/root/.cache/huggingface
+export CUDA_VISIBLE_DEVICES=0
+
+# Update system
 apt-get update -qq
-apt-get install -y -qq wget curl git python3 python3-pip
+apt-get install -y curl wget git htop
 
-# Upgrade pip and install necessary packages
-echo "📦 Installing packages with hf-transfer for faster downloads..."
-python3 -m pip install --upgrade pip setuptools wheel --quiet
-python3 -m pip install --quiet vllm transformers accelerate hf-transfer huggingface_hub
+# Install compatible PyTorch versions (crucial for avoiding errors)
+echo "📦 Installing compatible PyTorch versions..."
+pip uninstall torch torchvision torchaudio -y
+pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu121
 
-# Create API directory
-mkdir -p /root/api
-cd /root/api
+# Install required packages
+echo "📦 Installing dependencies..."
+pip install --upgrade pip setuptools wheel
+pip install transformers==4.44.0 accelerate bitsandbytes optimum
+pip install fastapi uvicorn aiohttp pydantic typing-extensions
+pip install hf_transfer  # Fixes the hf_transfer error
 
-# Enable faster and reliable model download
-export HF_HUB_ENABLE_HF_TRANSFER=1
+# Verify installations
+echo "🧪 Verifying installations..."
+python -c "import torch; import transformers; print(f'✅ Torch: {torch.__version__}, Transformers: {transformers.__version__}')"
+python -c "import torch; print(f'✅ CUDA Available: {torch.cuda.is_available()}')"
 
-echo "📥 Starting optimized model download with parallel workers..."
-# Fast parallel snapshot download with resume enabled
-python3 -c "
-from huggingface_hub import snapshot_download
-import os
-os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1'
-snapshot_download(
-    repo_id='openai/gpt-oss-20b',
-    local_dir='./model',
-    local_dir_use_symlinks=False,
-    resume_download=True,
-    max_workers=12
-)"
-
-# Create optimized start script
-cat > /root/api/start_vllm_optimized.sh << 'VLLM_SCRIPT'
-#!/bin/bash
-echo "🚀 Starting Optimized GPT-OSS-20B Server"
-echo "Endpoint: http://YOUR_VAST_IP:8000/v1/chat/completions"
-
-cd /root/api
-
-# Set optimization environment variables
-export HF_HUB_ENABLE_HF_TRANSFER=1
-export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-
-# Optimized vLLM serve command
-vllm serve ./model \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --served-model-name "gpt-oss-20b" \
-  --gpu-memory-utilization 0.9 \
-  --max-model-len 2048 \
-  --trust-remote-code \
-  --disable-log-requests \
-  --dtype auto \
-  --enable-chunked-prefill \
-  --max-num-seqs 8
-VLLM_SCRIPT
-
-chmod +x /root/api/start_vllm_optimized.sh
-
-# Create comprehensive test script
-cat > /root/api/test_api.py << 'TEST_SCRIPT'
+# Create the GPT-OSS-20B API server
+echo "🤖 Creating GPT-OSS-20B API server..."
+cat > /root/gpt_oss_server.py << 'EOF'
 #!/usr/bin/env python3
-import requests
-import json
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uvicorn
 import time
+import logging
+from typing import List, Optional
+import gc
 
-def wait_for_api(max_retries=30):
-    for i in range(max_retries):
-        try:
-            response = requests.get("http://localhost:8000/health", timeout=5)
-            if response.status_code == 200:
-                print("✅ API is ready!")
-                return True
-        except:
-            pass
-        print(f"⏳ Waiting for API... ({i+1}/{max_retries})")
-        time.sleep(10)
-    return False
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def test_api():
-    url = "http://localhost:8000/v1/chat/completions"
-    
-    # Test with Indian property listing (your use case)
-    payload = {
-        "model": "gpt-oss-20b",
-        "messages": [
+app = FastAPI(title="GPT-OSS-20B API", description="OpenAI-compatible API for GPT-OSS-20B")
+
+# Global variables for model and tokenizer
+model = None
+tokenizer = None
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[Message]
+    temperature: Optional[float] = 0.7
+    max_tokens: Optional[int] = 1500
+    top_p: Optional[float] = 1.0
+    stream: Optional[bool] = False
+
+@app.on_event("startup")
+async def load_model():
+    global model, tokenizer
+    try:
+        logger.info("🔄 Loading GPT-OSS-20B model...")
+        model_name = "openai/gpt-oss-20b"
+        
+        # Load tokenizer
+        logger.info("📝 Loading tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, 
+            trust_remote_code=True,
+            use_fast=True
+        )
+        
+        # Load model with optimizations
+        logger.info("🧠 Loading model (this may take 10-15 minutes)...")
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            max_memory={0: "37GB"}  # Leave some headroom on A100
+        )
+        
+        logger.info("✅ GPT-OSS-20B loaded successfully!")
+        logger.info(f"📊 Model device: {model.device}")
+        logger.info(f"📊 GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to load model: {e}")
+        raise e
+
+@app.get("/")
+async def root():
+    return {"message": "GPT-OSS-20B API Server", "status": "running"}
+
+@app.get("/health")
+async def health():
+    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0
+    return {
+        "status": "healthy",
+        "model": "openai/gpt-oss-20b",
+        "gpu_available": torch.cuda.is_available(),
+        "gpu_memory_gb": f"{gpu_memory:.1f}",
+        "model_loaded": model is not None
+    }
+
+@app.get("/v1/models")
+async def list_models():
+    return {
+        "object": "list",
+        "data": [
             {
-                "role": "system",
-                "content": "You are an expert JSON converter that transforms Indian property-listing data into UI-friendly JSON for accommodation platforms."
-            },
-            {
-                "role": "user", 
-                "content": "Generate a 3BHK semi-furnished apartment in HSR Layout, Bengaluru for working professionals. Price range ₹40,000-60,000/month."
+                "id": "openai/gpt-oss-20b",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "openai"
             }
-        ],
-        "temperature": 0.7,
-        "max_tokens": 1500
+        ]
     }
-    
-    print("🧪 Testing GPT-OSS-20B API with Property Listing...")
-    
-    try:
-        response = requests.post(url, json=payload, timeout=90)
-        
-        if response.status_code == 200:
-            data = response.json()
-            content = data['choices'][0]['message']['content']
-            
-            print("✅ SUCCESS! API Response:")
-            print("-" * 50)
-            print(content)
-            print("-" * 50)
-            
-            if 'usage' in data:
-                usage = data['usage']
-                print(f"\n📊 Token Usage:")
-                print(f"- Prompt tokens: {usage.get('prompt_tokens', 'N/A')}")
-                print(f"- Completion tokens: {usage.get('completion_tokens', 'N/A')}")
-                print(f"- Total tokens: {usage.get('total_tokens', 'N/A')}")
-                
-            print("\n✅ Your GPT-OSS-20B API is fully functional!")
-            print("🔗 API Endpoint: http://YOUR_VAST_IP:8000/v1/chat/completions")
-            
-        else:
-            print(f"❌ Error: {response.status_code}")
-            print("Response:", response.text)
-            
-    except Exception as e:
-        print(f"❌ Connection error: {e}")
 
-def test_simple_json():
-    url = "http://localhost:8000/v1/chat/completions"
-    
-    payload = {
-        "model": "gpt-oss-20b",
-        "messages": [
-            {"role": "user", "content": "Generate a simple JSON object with name, age, and city fields"}
-        ],
-        "temperature": 0.3,
-        "max_tokens": 500
-    }
-    
-    print("\n🔧 Testing Simple JSON Generation...")
+@app.post("/v1/chat/completions")
+async def chat_completions(request: ChatCompletionRequest):
+    if model is None or tokenizer is None:
+        raise HTTPException(status_code=503, detail="Model not loaded yet. Please wait.")
     
     try:
-        response = requests.post(url, json=payload, timeout=30)
+        # Format conversation for GPT-OSS-20B
+        conversation = ""
+        for msg in request.messages:
+            if msg.role == "system":
+                conversation += f"System: {msg.content}\n"
+            elif msg.role == "user":
+                conversation += f"User: {msg.content}\n"
+            elif msg.role == "assistant":
+                conversation += f"Assistant: {msg.content}\n"
         
-        if response.status_code == 200:
-            data = response.json()
-            content = data['choices'][0]['message']['content']
-            print("Generated Response:")
-            print(content)
-            
-            try:
-                import json
-                parsed = json.loads(content)
-                print("✅ Valid JSON structure!")
-            except:
-                print("⚠️ Generated text, but not valid JSON")
-        else:
-            print(f"❌ Error: {response.status_code}")
-            
+        conversation += "Assistant:"
+        
+        # Tokenize input
+        inputs = tokenizer(
+            conversation, 
+            return_tensors="pt", 
+            truncation=True, 
+            max_length=4096
+        )
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        
+        # Generate response
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=min(request.max_tokens, 2048),
+                temperature=request.temperature,
+                top_p=request.top_p,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+                repetition_penalty=1.1,
+                use_cache=True
+            )
+        
+        # Decode response
+        full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response_text = full_response[len(conversation):].strip()
+        
+        # Clean up GPU memory
+        del outputs
+        torch.cuda.empty_cache()
+        
+        return {
+            "id": f"chatcmpl-{int(time.time())}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": request.model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": response_text
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": inputs['input_ids'].shape[1],
+                "completion_tokens": outputs.shape[1] - inputs['input_ids'].shape[1],
+                "total_tokens": outputs.shape[1]
+            }
+        }
+        
     except Exception as e:
-        print(f"❌ Error: {e}")
+        logger.error(f"Error in chat completion: {e}")
+        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
 
 if __name__ == "__main__":
-    if wait_for_api():
-        print("=" * 60)
-        test_api()
-        print("=" * 60)
-        test_simple_json()
-        print("=" * 60)
-    else:
-        print("❌ API failed to start within timeout period")
-TEST_SCRIPT
+    logger.info("🚀 Starting GPT-OSS-20B API Server")
+    logger.info("📍 Endpoints:")
+    logger.info("  - Health: http://0.0.0.0:8000/health")
+    logger.info("  - API: http://0.0.0.0:8000/v1/chat/completions")
+    logger.info("  - Models: http://0.0.0.0:8000/v1/models")
+    
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        log_level="info",
+        access_log=True
+    )
+EOF
 
-chmod +x /root/api/test_api.py
+# Make the script executable
+chmod +x /root/gpt_oss_server.py
 
-# Create monitoring script
-cat > /root/api/monitor.sh << 'MONITOR'
-#!/bin/bash
-echo "📊 GPT-OSS-20B Optimized API Monitor"
-echo "Expected: ~30GB GPU memory usage"
-echo ""
+echo "🤖 Starting GPT-OSS-20B API server..."
+echo "$(date): Starting GPT-OSS-20B server" >> /root/setup.log
 
-while true; do
-    clear
-    echo "=== GPU STATUS ==="
-    if command -v nvidia-smi &> /dev/null; then
-        nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits
-    else
-        echo "nvidia-smi not available"
-    fi
-    echo ""
-    echo "=== API STATUS ==="
-    if curl -s http://localhost:8000/health > /dev/null 2>&1; then
-        echo "✅ API is running"
-        echo "🔗 Endpoint: http://YOUR_VAST_IP:8000/v1/chat/completions"
-    else
-        echo "❌ API not responding"
-    fi
-    echo ""
-    echo "Press Ctrl+C to exit"
-    sleep 5
-done
-MONITOR
+# Start the server
+cd /root && python gpt_oss_server.py
 
-chmod +x /root/api/monitor.sh
-
-# Create README
-cat > /root/api/README.txt << 'README'
-🚀 GPT-OSS-20B Optimized vLLM Setup
-
-YOUR API IS RUNNING AT:
-http://YOUR_VAST_IP:8000/v1/chat/completions
-
-OPTIMIZED SETTINGS:
-- GPU Memory Utilization: 90% (~30GB/40GB)
-- Max Token Length: 2048 tokens
-- Max Concurrent Requests: 8
-- Chunked Prefill: Enabled
-- Data Type: Auto-optimized
-- Fast Download: hf-transfer enabled
-
-INTEGRATION:
-Update your code:
-API_URL = "http://YOUR_VAST_IP:8000/v1/chat/completions"
-MODEL = "gpt-oss-20b"
-
-COMMANDS:
-- Start API: ./start_vllm_optimized.sh
-- Test API: python3 test_api.py
-- Monitor: ./monitor.sh
-
-FEATURES:
-- 100% OpenAI API Compatible
-- Production-ready performance
-- Optimized for A100 GPU
-- Perfect for property listings
-README
-
-echo ""
-echo "✅ OPTIMIZED SETUP COMPLETE! AUTO-STARTING API SERVER..."
-echo ""
-echo "🎯 DOWNLOAD OPTIMIZATIONS:"
-echo "   - hf-transfer: Rust-based parallel downloads"
-echo "   - 12 parallel workers: Faster concurrent downloads"
-echo "   - Resume download: Continues if interrupted"
-echo "   - Progress tracking: Real-time download status"
-echo ""
-echo "🎯 SERVER OPTIMIZATIONS:"
-echo "   - GPU Memory: 90% utilization (~30GB)"
-echo "   - Max Tokens: 2048 (doubled capacity)"
-echo "   - Concurrent Requests: 8 simultaneous"
-echo "   - Chunked Prefill: Memory efficient"
-echo ""
-echo "🌐 YOUR API ENDPOINT:"
-echo "   http://YOUR_VAST_IP:8000/v1/chat/completions"
-echo ""
-echo "🔧 UPDATE YOUR CODE:"
-echo "   API_URL = \"http://YOUR_VAST_IP:8000/v1/chat/completions\""
-echo "   MODEL = \"gpt-oss-20b\""
-echo ""
-echo "💰 Expected: ~22 hours runtime with $10"
-echo "📊 Memory: ~30GB/40GB GPU usage (optimized)"
-echo ""
-echo "🎯 Starting optimized vLLM server now..."
-
-# AUTO-START THE OPTIMIZED API SERVER
-cd /root/api
-./start_vllm_optimized.sh &
-
-# Wait for startup then run test
-sleep 45 && python3 /root/api/test_api.py &
-
-# Keep the main process running
-wait
+echo "$(date): Setup completed" >> /root/setup.log
