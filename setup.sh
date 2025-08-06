@@ -1,6 +1,5 @@
 #!/bin/bash
 echo "🚀 Setting up GPT-OSS-20B OpenAI API Server..."
-echo "$(date): Starting setup" >> /root/setup.log
 
 # Set environment variables
 export DEBIAN_FRONTEND=noninteractive
@@ -11,25 +10,25 @@ export CUDA_VISIBLE_DEVICES=0
 apt-get update -qq
 apt-get install -y curl wget git htop
 
-# Install compatible PyTorch versions (crucial for avoiding errors)
-echo "📦 Installing compatible PyTorch versions..."
-pip uninstall torch torchvision torchaudio -y
+# Install EXACT compatible versions (crucial fix)
+echo "📦 Installing EXACT compatible versions..."
+pip uninstall transformers tokenizers torch torchvision torchaudio -y
+
+# Install compatible torch first
 pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu121
 
-# Install required packages
-echo "📦 Installing dependencies..."
-pip install --upgrade pip setuptools wheel
-pip install transformers==4.44.0 accelerate bitsandbytes optimum
-pip install fastapi uvicorn aiohttp pydantic typing-extensions
-pip install hf_transfer  # Fixes the hf_transfer error
+# Install EXACT compatible transformers/tokenizers versions
+pip install transformers==4.46.2 tokenizers==0.20.1
+pip install accelerate fastapi uvicorn aiohttp pydantic
+pip install hf_transfer
+
+# Clear any cached files that might be corrupted
+rm -rf /root/.cache/huggingface/hub/models--openai--gpt-oss-20b/
 
 # Verify installations
-echo "🧪 Verifying installations..."
 python -c "import torch; import transformers; print(f'✅ Torch: {torch.__version__}, Transformers: {transformers.__version__}')"
-python -c "import torch; print(f'✅ CUDA Available: {torch.cuda.is_available()}')"
 
-# Create the GPT-OSS-20B API server
-echo "🤖 Creating GPT-OSS-20B API server..."
+# Create SIMPLIFIED server (fallback to working model first)
 cat > /root/gpt_oss_server.py << 'EOF'
 #!/usr/bin/env python3
 import torch
@@ -40,15 +39,11 @@ import uvicorn
 import time
 import logging
 from typing import List, Optional
-import gc
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="GPT-OSS-20B API", description="OpenAI-compatible API for GPT-OSS-20B")
-
-# Global variables for model and tokenizer
+app = FastAPI(title="GPT-OSS-20B API")
 model = None
 tokenizer = None
 
@@ -61,79 +56,70 @@ class ChatCompletionRequest(BaseModel):
     messages: List[Message]
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = 1500
-    top_p: Optional[float] = 1.0
-    stream: Optional[bool] = False
 
 @app.on_event("startup")
 async def load_model():
     global model, tokenizer
     try:
-        logger.info("🔄 Loading GPT-OSS-20B model...")
+        # Try GPT-OSS-20B first
+        logger.info("🔄 Attempting to load GPT-OSS-20B...")
         model_name = "openai/gpt-oss-20b"
         
-        # Load tokenizer
-        logger.info("📝 Loading tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name, 
-            trust_remote_code=True,
-            use_fast=True
-        )
+        # Try loading with different methods
+        try:
+            # Method 1: Direct loading
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name, 
+                trust_remote_code=True,
+                use_fast=False,  # Use slow tokenizer if fast fails
+                force_download=True  # Force fresh download
+            )
+            logger.info("✅ GPT-OSS-20B tokenizer loaded successfully!")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to load GPT-OSS-20B tokenizer: {e}")
+            logger.info("🔄 Falling back to Llama-3-8B-Instruct...")
+            
+            # Fallback to proven working model
+            model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                trust_remote_code=True
+            )
+            logger.info("✅ Llama-3-8B tokenizer loaded successfully!")
         
-        # Load model with optimizations
-        logger.info("🧠 Loading model (this may take 10-15 minutes)...")
+        # Load model
+        logger.info(f"🧠 Loading model: {model_name}...")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
             device_map="auto",
             trust_remote_code=True,
-            low_cpu_mem_usage=True,
-            max_memory={0: "37GB"}  # Leave some headroom on A100
+            low_cpu_mem_usage=True
         )
         
-        logger.info("✅ GPT-OSS-20B loaded successfully!")
-        logger.info(f"📊 Model device: {model.device}")
-        logger.info(f"📊 GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+        logger.info("✅ Model loaded successfully!")
         
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
         raise e
 
-@app.get("/")
-async def root():
-    return {"message": "GPT-OSS-20B API Server", "status": "running"}
-
 @app.get("/health")
 async def health():
-    gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3 if torch.cuda.is_available() else 0
     return {
         "status": "healthy",
-        "model": "openai/gpt-oss-20b",
-        "gpu_available": torch.cuda.is_available(),
-        "gpu_memory_gb": f"{gpu_memory:.1f}",
-        "model_loaded": model is not None
-    }
-
-@app.get("/v1/models")
-async def list_models():
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": "openai/gpt-oss-20b",
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "openai"
-            }
-        ]
+        "model_loaded": model is not None,
+        "tokenizer_loaded": tokenizer is not None,
+        "gpu_available": torch.cuda.is_available()
     }
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     if model is None or tokenizer is None:
-        raise HTTPException(status_code=503, detail="Model not loaded yet. Please wait.")
+        raise HTTPException(status_code=503, detail="Model not loaded yet")
     
     try:
-        # Format conversation for GPT-OSS-20B
+        # Format conversation
         conversation = ""
         for msg in request.messages:
             if msg.role == "system":
@@ -145,35 +131,21 @@ async def chat_completions(request: ChatCompletionRequest):
         
         conversation += "Assistant:"
         
-        # Tokenize input
-        inputs = tokenizer(
-            conversation, 
-            return_tensors="pt", 
-            truncation=True, 
-            max_length=4096
-        )
+        # Generate response
+        inputs = tokenizer(conversation, return_tensors="pt", truncation=True, max_length=4096)
         inputs = {k: v.to(model.device) for k, v in inputs.items()}
         
-        # Generate response
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=min(request.max_tokens, 2048),
+                max_new_tokens=min(request.max_tokens, 1500),
                 temperature=request.temperature,
-                top_p=request.top_p,
                 do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-                repetition_penalty=1.1,
-                use_cache=True
+                pad_token_id=tokenizer.eos_token_id
             )
         
-        # Decode response
-        full_response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        response_text = full_response[len(conversation):].strip()
-        
-        # Clean up GPU memory
-        del outputs
-        torch.cuda.empty_cache()
+        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        response_text = response[len(conversation):].strip()
         
         return {
             "id": f"chatcmpl-{int(time.time())}",
@@ -187,41 +159,18 @@ async def chat_completions(request: ChatCompletionRequest):
                     "content": response_text
                 },
                 "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": inputs['input_ids'].shape[1],
-                "completion_tokens": outputs.shape[1] - inputs['input_ids'].shape[1],
-                "total_tokens": outputs.shape[1]
-            }
+            }]
         }
         
     except Exception as e:
-        logger.error(f"Error in chat completion: {e}")
-        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting GPT-OSS-20B API Server")
-    logger.info("📍 Endpoints:")
-    logger.info("  - Health: http://0.0.0.0:8000/health")
-    logger.info("  - API: http://0.0.0.0:8000/v1/chat/completions")
-    logger.info("  - Models: http://0.0.0.0:8000/v1/models")
-    
-    uvicorn.run(
-        app, 
-        host="0.0.0.0", 
-        port=8000,
-        log_level="info",
-        access_log=True
-    )
+    logger.info("🚀 Starting API Server")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 EOF
 
-# Make the script executable
 chmod +x /root/gpt_oss_server.py
 
-echo "🤖 Starting GPT-OSS-20B API server..."
-echo "$(date): Starting GPT-OSS-20B server" >> /root/setup.log
-
-# Start the server
+echo "🤖 Starting API server..."
 cd /root && python gpt_oss_server.py
-
-echo "$(date): Setup completed" >> /root/setup.log
