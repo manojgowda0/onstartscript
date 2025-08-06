@@ -1,97 +1,66 @@
 #!/bin/bash
-# Simplified GPT-OSS-20B Setup - OpenAI API Compatible Only
+# GPT-OSS-20B Simple vLLM Serve Setup - OpenAI API Compatible
 # Copy-paste this into Vast.ai "On-start script" box
 
 set -e
 
-echo "🚀 Setting up GPT-OSS-20B OpenAI-Compatible API..."
+echo "🚀 Setting up GPT-OSS-20B with Simple vLLM Serve..."
 
 # System setup
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq wget curl git python3 python3-pip
 
-# Upgrade pip and related tools FIRST
-echo "⬆️ Upgrading pip and setuptools..."
+# Upgrade pip and install required packages
+echo "📦 Installing packages..."
 python3 -m pip install --upgrade pip setuptools wheel --quiet
 
-# Install transformers with retry fallback function
-install_transformers() {
-  echo "📦 Installing transformers with fallback mirrors..."
-  python3 -m pip install --no-cache-dir --quiet transformers || \
-  python3 -m pip install --index-url https://pypi.org/simple/ --quiet transformers || \
-  python3 -m pip install -i https://mirrors.aliyun.com/pypi/simple/ --quiet transformers || \
-  python3 -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple/ --quiet transformers
-}
+# Install vLLM and dependencies with fallback
+echo "📦 Installing vLLM and dependencies..."
+python3 -m pip install --quiet vllm || \
+python3 -m pip install --index-url https://pypi.org/simple/ --quiet vllm
 
-# Install core packages with error handling
-echo "📦 Installing PyTorch and dependencies..."
-python3 -m pip install --quiet \
-    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 || {
-    echo "⚠️ PyTorch installation failed, trying alternative..."
-    python3 -m pip install --quiet torch torchvision torchaudio
-}
+# Install supporting packages
+python3 -m pip install --quiet transformers accelerate hf-transfer
 
-python3 -m pip install --quiet accelerate vllm huggingface_hub
-
-# Install transformers with retry mechanism
-install_transformers
-
-# Verify critical packages are installed
-echo "🔍 Verifying installations..."
-python3 -c "import torch; print('✅ PyTorch installed')"
-python3 -c "import transformers; print('✅ Transformers installed')"
-python3 -c "import vllm; print('✅ vLLM installed')"
-
-# Create simple directory structure
+# Create API directory
 mkdir -p /root/api
 cd /root/api
 
-# Ensure huggingface-cli is available
-if ! command -v huggingface-cli &> /dev/null; then
-    echo "📥 Installing huggingface-cli..."
-    python3 -m pip install --quiet huggingface_hub[cli]
-fi
+# Download GPT-OSS-20B model
+echo "📥 Downloading GPT-OSS-20B model..."
+python3 -c "
+from huggingface_hub import snapshot_download
+snapshot_download('openai/gpt-oss-20b', local_dir='./model', local_dir_use_symlinks=False)
+"
 
-# Download GPT-OSS-20B model with progress
-echo "📥 Downloading GPT-OSS-20B (21B parameters)..."
-huggingface-cli download microsoft/DialoGPT-large --local-dir ./model --local-dir-use-symlinks False || {
-    echo "⚠️ Model download failed, please check model name and try again"
-    exit 1
-}
-
-# Create the API server script
-cat > /root/api/start_api.sh << 'API_SERVER'
+# Create the simple startup script
+cat > /root/api/start_vllm.sh << 'VLLM_SCRIPT'
 #!/bin/bash
-echo "🔥 Starting OpenAI-Compatible API Server"
-echo "Endpoint: http://YOUR_VAST_IP:8000/v1/chat/completions"
-echo ""
+echo "🚀 Starting GPT-OSS-20B with Simple vLLM Serve"
+echo "Endpoint: http://143.55.45.86:8000/v1/chat/completions"
 
 cd /root/api
 
-# Check if model exists
-if [ ! -d "./model" ]; then
-    echo "❌ Model directory not found!"
-    exit 1
-fi
+# Set optimization environment variables
+export HF_HUB_ENABLE_HF_TRANSFER=1
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
 
-# Start vLLM OpenAI-compatible server
-python3 -m vllm.entrypoints.openai.api_server \
-    --model ./model \
-    --served-model-name "gpt-oss-20b" \
-    --dtype bfloat16 \
-    --gpu-memory-utilization 0.8 \
-    --max-model-len 4096 \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --trust-remote-code \
-    --disable-log-requests
-API_SERVER
+# Use simple vLLM serve command (avoids compilation issues)
+vllm serve ./model \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name "gpt-oss-20b" \
+  --gpu-memory-utilization 0.8 \
+  --max-model-len 1024 \
+  --trust-remote-code \
+  --disable-log-requests
+VLLM_SCRIPT
 
-chmod +x /root/api/start_api.sh
+chmod +x /root/api/start_vllm.sh
 
-# Create comprehensive test script
-cat > /root/api/test_openai_format.py << 'TEST_SCRIPT'
+# Create test script
+cat > /root/api/test_api.py << 'TEST_SCRIPT'
 #!/usr/bin/env python3
 import requests
 import json
@@ -111,192 +80,108 @@ def wait_for_api(max_retries=30):
         time.sleep(10)
     return False
 
-def test_openai_api():
-    """Test the API with exact OpenAI format"""
-    
+def test_api():
     url = "http://localhost:8000/v1/chat/completions"
-    
-    headers = {
-        "Content-Type": "application/json",
-    }
     
     payload = {
         "model": "gpt-oss-20b",
         "messages": [
             {
                 "role": "system",
-                "content": "You are an expert JSON converter that transforms Indian property-listing data into UI-friendly JSON for accommodation platforms..."
+                "content": "You are an expert JSON converter for Indian property listings."
             },
             {
                 "role": "user", 
-                "content": "Generate 3BHK semi-furnished apartment in HSR Layout, Bengaluru for working professionals. Price range ₹40,000-60,000/month."
+                "content": "Generate a 3BHK apartment listing in HSR Layout, Bangalore for ₹50,000/month"
             }
         ],
         "temperature": 0.7,
-        "max_tokens": 2000
+        "max_tokens": 1000
     }
     
-    print("🧪 Testing OpenAI API Format...")
-    print("URL:", url)
+    print("🧪 Testing GPT-OSS-20B API...")
     
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=60)
-        
-        print(f"Status Code: {response.status_code}")
+        response = requests.post(url, json=payload, timeout=60)
         
         if response.status_code == 200:
-            response_data = response.json()
+            data = response.json()
+            content = data['choices'][0]['message']['content']
             
-            print("✅ SUCCESS! Response structure:")
-            print(f"- ID: {response_data.get('id', 'N/A')}")
-            print(f"- Object: {response_data.get('object', 'N/A')}")
-            print(f"- Model: {response_data.get('model', 'N/A')}")
-            
-            content = response_data['choices'][0]['message']['content']
-            print("\n📄 Generated Content:")
+            print("✅ SUCCESS! API Response:")
             print("-" * 40)
             print(content)
             print("-" * 40)
             
-            if 'usage' in response_data:
-                usage = response_data['usage']
-                print(f"\n📊 Token Usage:")
-                print(f"- Prompt tokens: {usage.get('prompt_tokens', 'N/A')}")
-                print(f"- Completion tokens: {usage.get('completion_tokens', 'N/A')}")
-                print(f"- Total tokens: {usage.get('total_tokens', 'N/A')}")
-            
-            print("\n✅ API is fully compatible with your OpenAI client!")
-            
+            # Token usage
+            if 'usage' in data:
+                usage = data['usage']
+                print(f"📊 Tokens: {usage.get('total_tokens', 'N/A')}")
+                
+            print("\n✅ Your GPT-OSS-20B API is fully functional!")
         else:
             print(f"❌ Error: {response.status_code}")
-            print("Response:", response.text)
+            print(response.text)
             
     except Exception as e:
         print(f"❌ Connection error: {e}")
 
 if __name__ == "__main__":
     if wait_for_api():
-        print("=" * 50)
-        test_openai_api()
-        print("=" * 50)
+        test_api()
     else:
-        print("❌ API failed to start within timeout period")
+        print("❌ API failed to start within timeout")
 TEST_SCRIPT
 
-chmod +x /root/api/test_openai_format.py
-
-# Create monitoring script
-cat > /root/api/monitor.sh << 'MONITOR'
-#!/bin/bash
-echo "📊 GPT-OSS-20B API Monitor"
-echo "Expected: ~25GB GPU memory usage"
-echo ""
-
-while true; do
-    clear
-    echo "=== GPU STATUS ==="
-    if command -v nvidia-smi &> /dev/null; then
-        nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits
-    else
-        echo "nvidia-smi not available"
-    fi
-    echo ""
-    echo "=== API STATUS ==="
-    if curl -s http://localhost:8000/health > /dev/null 2>&1; then
-        echo "✅ API is running"
-    else
-        echo "❌ API not responding"
-    fi
-    echo ""
-    echo "Press Ctrl+C to exit"
-    sleep 5
-done
-MONITOR
-
-chmod +x /root/api/monitor.sh
-
-# Create troubleshooting script
-cat > /root/api/troubleshoot.sh << 'TROUBLESHOOT'
-#!/bin/bash
-echo "🔧 Troubleshooting GPT-OSS-20B API"
-echo ""
-
-echo "=== CHECKING PYTHON PACKAGES ==="
-python3 -c "import torch; print(f'PyTorch: {torch.__version__}')"
-python3 -c "import transformers; print(f'Transformers: {transformers.__version__}')"
-python3 -c "import vllm; print(f'vLLM: {vllm.__version__}')"
-
-echo ""
-echo "=== CHECKING GPU ==="
-nvidia-smi --query-gpu=name,memory.total,memory.used --format=csv
-
-echo ""
-echo "=== CHECKING MODEL ==="
-if [ -d "./model" ]; then
-    echo "✅ Model directory exists"
-    ls -la ./model/
-else
-    echo "❌ Model directory missing"
-fi
-
-echo ""
-echo "=== CHECKING LOGS ==="
-if [ -f "nohup.out" ]; then
-    echo "Recent log entries:"
-    tail -20 nohup.out
-else
-    echo "No log file found"
-fi
-
-echo ""
-echo "=== NETWORK TEST ==="
-curl -I https://pypi.org/simple/ || echo "PyPI unreachable"
-TROUBLESHOOT
-
-chmod +x /root/api/troubleshoot.sh
+chmod +x /root/api/test_api.py
 
 # Create README
 cat > /root/api/README.txt << 'README'
-🚀 GPT-OSS-20B OpenAI-Compatible API
+🚀 GPT-OSS-20B Simple vLLM Setup
 
-QUICK START:
-1. Start API: ./start_api.sh
-2. Test API: python3 test_openai_format.py  
-3. Monitor: ./monitor.sh
-4. Troubleshoot: ./troubleshoot.sh
-
-API ENDPOINT:
+YOUR API IS RUNNING AT:
 http://YOUR_VAST_IP:8000/v1/chat/completions
 
-EXACT FORMAT FOR YOUR CLIENT:
-- URL: http://YOUR_VAST_IP:8000/v1/chat/completions
-- Headers: Content-Type: application/json
-- No authentication required
-- Same request/response format as OpenAI
+INTEGRATION:
+Update your code:
+API_URL = "http://YOUR_VAST_IP:8000/v1/chat/completions"
+MODEL = "gpt-oss-20b"
 
-UPDATE YOUR CONFIG:
-API_URL=http://YOUR_VAST_IP:8000/v1/chat/completions
-MODEL=gpt-oss-20b
+TESTING:
+python3 test_api.py
 
-MEMORY USAGE: ~25GB/40GB
-RUNTIME: ~22 hours with $10
+FEATURES:
+- 100% OpenAI API Compatible
+- No compilation issues
+- Production-ready vLLM serve
+- A100 GPU optimized
+
+COMMANDS:
+- Restart API: ./start_vllm.sh
+- Test API: python3 test_api.py
 README
 
 echo ""
-echo "✅ SETUP COMPLETE WITH ERROR HANDLING!"
-echo ""
-echo "🎯 NEXT STEPS:"
-echo "1. Connect to your Vast.ai instance"  
-echo "2. cd /root/api"
-echo "3. ./start_api.sh"
-echo "4. Test with: python3 test_openai_format.py"
-echo ""
-echo "🔧 If issues occur:"
-echo "   ./troubleshoot.sh"
+echo "✅ SETUP COMPLETE! AUTO-STARTING API SERVER..."
 echo ""
 echo "🌐 YOUR API ENDPOINT:"
-echo "   http://YOUR_VAST_IP:8000/v1/chat/completions"
+echo "   http://143.55.45.86:8000/v1/chat/completions"
 echo ""
+echo "🔧 UPDATE YOUR CODE:"
+echo "   API_URL = \"http://143.55.45.86:8000/v1/chat/completions\""
+echo "   MODEL = \"gpt-oss-20b\""
+echo ""
+echo "💰 Expected: ~22 hours runtime with $10"
+echo "📊 Memory: ~25GB/40GB GPU usage"
+echo ""
+echo "🎯 Starting vLLM server now..."
 
-# Don't auto-start - let user start manually for better control
-echo "🚀 Setup complete! Run './start_api.sh' when ready."
+# AUTO-START THE API SERVER
+cd /root/api
+./start_vllm.sh &
+
+# Wait a moment then run test in background
+sleep 30 && python3 test_api.py &
+
+# Keep the main process running
+wait
